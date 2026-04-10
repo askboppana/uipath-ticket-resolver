@@ -1,0 +1,2 @@
+UAT: uipath-ticket-resolver STAGE
+Status: PENDING APPROVAL
