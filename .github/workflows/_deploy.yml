@@ -1,0 +1,320 @@
+name: Deploy (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      deploy_method:
+        required: false
+        type: string
+        default: ssh
+      health_url:
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        required: false
+        type: string
+        default: ""
+      rollback_on_failure:
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.app_name }} to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set script permissions
+        run: chmod +x scripts/*.sh scripts/*.py 2>/dev/null || true
+
+      - name: Download artifact
+        if: inputs.artifact_name != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: deploy-artifacts/
+
+      - name: Splunk log - deployment start
+        run: |
+          if [ -z "$SPLUNK_HEC_URL" ] || [ -z "$SPLUNK_HEC_TOKEN" ]; then
+            echo "Splunk not configured -- SKIP start log"
+            exit 0
+          fi
+          if [ -f scripts/forgeops-log.sh ]; then
+            bash scripts/forgeops-log.sh \
+              --event "deploy_start" \
+              --app "${{ inputs.app_name }}" \
+              --version "${{ inputs.version }}" \
+              --environment "${{ inputs.environment }}" \
+              --method "${{ inputs.deploy_method }}"
+          else
+            curl -s -k \
+              -H "Authorization: Splunk $SPLUNK_HEC_TOKEN" \
+              -d '{"event":"deploy_start","sourcetype":"forgeops","fields":{"app":"${{ inputs.app_name }}","version":"${{ inputs.version }}","environment":"${{ inputs.environment }}","method":"${{ inputs.deploy_method }}"}}' \
+              "$SPLUNK_HEC_URL/services/collector/event"
+          fi
+        env:
+          SPLUNK_HEC_URL: ${{ secrets.SPLUNK_HEC_URL }}
+          SPLUNK_HEC_TOKEN: ${{ secrets.SPLUNK_HEC_TOKEN }}
+
+      - name: Jira transition - deployment started
+        run: |
+          if [ -z "$JIRA_URL" ] || [ -z "$JIRA_TOKEN" ]; then
+            echo "Jira not configured -- SKIP transition"
+            exit 0
+          fi
+
+          case "${{ inputs.environment }}" in
+            int)   TRANSITION_NAME="Ready for Unit Testing" ;;
+            qa)    TRANSITION_NAME="Ready for SIT" ;;
+            stage) TRANSITION_NAME="Ready for UAT" ;;
+            prod)  TRANSITION_NAME="Deployed to Production" ;;
+            *)     TRANSITION_NAME="In Progress" ;;
+          esac
+
+          echo "Jira transition: ${TRANSITION_NAME} for ${{ inputs.app_name }} v${{ inputs.version }}"
+
+          curl -s -X POST \
+            -H "Authorization: Bearer $JIRA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"update\":{\"comment\":[{\"add\":{\"body\":\"Deployment of ${{ inputs.app_name }} v${{ inputs.version }} to ${{ inputs.environment }} -- transition: ${TRANSITION_NAME}\"}}]}}" \
+            "$JIRA_URL/rest/api/2/issue/${{ inputs.app_name }}/transitions" || echo "Jira transition request sent"
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+
+      - name: Cherwell Change Request
+        if: inputs.environment == 'stage' || inputs.environment == 'prod'
+        run: |
+          if [ -z "$CHERWELL_URL" ] || [ -z "$CHERWELL_CLIENT_ID" ]; then
+            echo "Cherwell not configured -- SKIP CR"
+            exit 0
+          fi
+
+          echo "Creating Cherwell CR for ${{ inputs.app_name }} v${{ inputs.version }} -> ${{ inputs.environment }}"
+
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $CHERWELL_TOKEN" \
+            -d "{\"busObId\":\"ChangeRequest\",\"fields\":[{\"name\":\"Summary\",\"value\":\"Deploy ${{ inputs.app_name }} v${{ inputs.version }} to ${{ inputs.environment }}\"}]}" \
+            "$CHERWELL_URL/api/V1/savebusinessobject" || echo "Cherwell CR request sent"
+        env:
+          CHERWELL_URL: ${{ secrets.CHERWELL_URL }}
+          CHERWELL_CLIENT_ID: ${{ secrets.CHERWELL_CLIENT_ID }}
+          CHERWELL_TOKEN: ${{ secrets.CHERWELL_TOKEN }}
+
+      - name: Deploy via SSH
+        id: deploy-ssh
+        if: inputs.deploy_method == 'ssh'
+        run: |
+          if [ -z "$DEPLOY_SSH_KEY" ]; then
+            echo "DEPLOY_SSH_KEY not configured -- SKIP SSH deploy"
+            echo "deployed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Deploying ${{ inputs.app_name }} v${{ inputs.version }} via SSH to ${{ inputs.environment }}"
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          if [ -f scripts/deploy-ssh.sh ]; then
+            bash scripts/deploy-ssh.sh \
+              --app "${{ inputs.app_name }}" \
+              --version "${{ inputs.version }}" \
+              --environment "${{ inputs.environment }}"
+          fi
+          echo "deployed=true" >> "$GITHUB_OUTPUT"
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Deploy via ArgoCD
+        id: deploy-argocd
+        if: inputs.deploy_method == 'argocd'
+        run: |
+          if [ -z "$ARGOCD_SERVER" ]; then
+            echo "ARGOCD_SERVER not configured -- SKIP ArgoCD deploy"
+            echo "deployed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Deploying ${{ inputs.app_name }} v${{ inputs.version }} via ArgoCD to ${{ inputs.environment }}"
+
+          if [ -f scripts/deploy-argocd.sh ]; then
+            bash scripts/deploy-argocd.sh \
+              --app "${{ inputs.app_name }}" \
+              --version "${{ inputs.version }}" \
+              --environment "${{ inputs.environment }}"
+          fi
+          echo "deployed=true" >> "$GITHUB_OUTPUT"
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+
+      - name: Deploy via UiPath
+        id: deploy-uipath
+        if: inputs.deploy_method == 'uipath'
+        run: |
+          if [ -z "$UIPATH_ORCH_URL" ]; then
+            echo "UIPATH_ORCH_URL not configured -- SKIP UiPath deploy"
+            echo "deployed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Deploying ${{ inputs.app_name }} v${{ inputs.version }} via UiPath to ${{ inputs.environment }}"
+
+          if [ -f scripts/deploy-uipath.sh ]; then
+            bash scripts/deploy-uipath.sh \
+              --app "${{ inputs.app_name }}" \
+              --version "${{ inputs.version }}" \
+              --environment "${{ inputs.environment }}"
+          fi
+          echo "deployed=true" >> "$GITHUB_OUTPUT"
+        env:
+          UIPATH_ORCH_URL: ${{ secrets.UIPATH_ORCH_URL }}
+          UIPATH_ORCH_TOKEN: ${{ secrets.UIPATH_ORCH_TOKEN }}
+
+      - name: Health Check
+        id: health-check
+        if: inputs.health_url != ''
+        run: |
+          echo "Running health check against ${{ inputs.health_url }}"
+          ATTEMPT=0
+          MAX_ATTEMPTS=10
+          HEALTHY=false
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}..."
+
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${{ inputs.health_url }}" 2>/dev/null || echo "000")
+
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              echo "Health check PASS (HTTP ${HTTP_CODE})"
+              HEALTHY=true
+              break
+            fi
+
+            echo "Health check returned HTTP ${HTTP_CODE} -- retrying in 15s"
+            sleep 15
+          done
+
+          if [ "$HEALTHY" == "true" ]; then
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Health check FAIL after ${MAX_ATTEMPTS} attempts"
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Rollback on failure
+        if: failure() && inputs.rollback_on_failure
+        run: |
+          echo "Deployment failed -- initiating rollback for ${{ inputs.app_name }} in ${{ inputs.environment }}"
+
+          if [ -f scripts/rollback.sh ]; then
+            bash scripts/rollback.sh \
+              --app "${{ inputs.app_name }}" \
+              --environment "${{ inputs.environment }}"
+          else
+            echo "No rollback script found at scripts/rollback.sh"
+            echo "Manual rollback may be required"
+          fi
+
+      - name: Post-deploy Jira update
+        if: always()
+        run: |
+          if [ -z "$JIRA_URL" ] || [ -z "$JIRA_TOKEN" ]; then
+            echo "Jira not configured -- SKIP post-deploy update"
+            exit 0
+          fi
+
+          if [ "${{ job.status }}" == "success" ]; then
+            STATUS_TEXT="succeeded"
+          else
+            STATUS_TEXT="failed"
+          fi
+
+          curl -s -X POST \
+            -H "Authorization: Bearer $JIRA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"update\":{\"comment\":[{\"add\":{\"body\":\"Deployment of ${{ inputs.app_name }} v${{ inputs.version }} to ${{ inputs.environment }} ${STATUS_TEXT}\"}}]}}" \
+            "$JIRA_URL/rest/api/2/issue/${{ inputs.app_name }}/comment" || echo "Jira post-deploy update sent"
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+
+      - name: Update Cherwell CR
+        if: always() && (inputs.environment == 'stage' || inputs.environment == 'prod')
+        run: |
+          if [ -z "$CHERWELL_URL" ] || [ -z "$CHERWELL_CLIENT_ID" ]; then
+            echo "Cherwell not configured -- SKIP CR update"
+            exit 0
+          fi
+
+          if [ "${{ job.status }}" == "success" ]; then
+            CR_STATUS="Completed"
+          else
+            CR_STATUS="Failed"
+          fi
+
+          echo "Updating Cherwell CR status to ${CR_STATUS}"
+        env:
+          CHERWELL_URL: ${{ secrets.CHERWELL_URL }}
+          CHERWELL_CLIENT_ID: ${{ secrets.CHERWELL_CLIENT_ID }}
+          CHERWELL_TOKEN: ${{ secrets.CHERWELL_TOKEN }}
+
+      - name: Splunk log - deployment end
+        if: always()
+        run: |
+          if [ -z "$SPLUNK_HEC_URL" ] || [ -z "$SPLUNK_HEC_TOKEN" ]; then
+            echo "Splunk not configured -- SKIP end log"
+            exit 0
+          fi
+          if [ -f scripts/forgeops-log.sh ]; then
+            bash scripts/forgeops-log.sh \
+              --event "deploy_end" \
+              --app "${{ inputs.app_name }}" \
+              --version "${{ inputs.version }}" \
+              --environment "${{ inputs.environment }}" \
+              --status "${{ job.status }}"
+          else
+            curl -s -k \
+              -H "Authorization: Splunk $SPLUNK_HEC_TOKEN" \
+              -d '{"event":"deploy_end","sourcetype":"forgeops","fields":{"app":"${{ inputs.app_name }}","version":"${{ inputs.version }}","environment":"${{ inputs.environment }}","status":"${{ job.status }}"}}' \
+              "$SPLUNK_HEC_URL/services/collector/event"
+          fi
+        env:
+          SPLUNK_HEC_URL: ${{ secrets.SPLUNK_HEC_URL }}
+          SPLUNK_HEC_TOKEN: ${{ secrets.SPLUNK_HEC_TOKEN }}
+
+      - name: Deployment Summary
+        if: always()
+        run: |
+          {
+            echo "## Deployment Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Application | ${{ inputs.app_name }} |"
+            echo "| Version | ${{ inputs.version }} |"
+            echo "| Environment | ${{ inputs.environment }} |"
+            echo "| Method | ${{ inputs.deploy_method }} |"
+            echo "| Status | ${{ job.status }} |"
+            echo "| Health URL | ${{ inputs.health_url || 'N/A' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

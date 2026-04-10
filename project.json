@@ -1,0 +1,1 @@
+{"name":"uipath-ticket-resolver","projectVersion":"1.0.0","description":"UiPath RPA bot for uipath-ticket-resolver","targetFramework":"Portable","dependencies":{"UiPath.System.Activities":"[23.10.3]","UiPath.UIAutomation.Activities":"[23.10.4]"}}

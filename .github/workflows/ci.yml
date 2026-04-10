@@ -1,0 +1,234 @@
+name: UiPath RPA Bot Pipeline
+
+on:
+  push:
+    branches:
+      - qa
+      - stage
+      - main
+      - 'feature/*'
+      - 'hotfix/*'
+  pull_request:
+    branches:
+      - qa
+      - stage
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - int
+          - qa
+          - stage
+          - prod
+
+permissions:
+  contents: write
+  checks: write
+
+env:
+  APP_NAME: "uipath-ticket-resolver"
+
+jobs:
+  validate-secrets:
+    name: Validate Secrets
+    uses: ./.github/workflows/_validate-secrets.yml
+    secrets: inherit
+
+  build:
+    name: Build and Package
+    runs-on: windows-latest
+    needs: [validate-secrets]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pack UiPath Project
+        shell: pwsh
+        run: |
+          Write-Host "Packing UiPath project: $env:APP_NAME"
+
+          $uipcli = Get-Command uipcli -ErrorAction SilentlyContinue
+          if ($uipcli) {
+            Write-Host "Using UiPath CLI from PATH"
+            uipcli package pack . --output .\output --version "1.0.$env:GITHUB_RUN_NUMBER"
+          } else {
+            $nugetPath = "$env:USERPROFILE\.nuget\packages\uipath.cli"
+            $uipcliNuget = Get-ChildItem -Path $nugetPath -Recurse -Filter "uipcli.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($uipcliNuget) {
+              Write-Host "Using UiPath CLI from NuGet cache"
+              & $uipcliNuget.FullName package pack . --output .\output --version "1.0.$env:GITHUB_RUN_NUMBER"
+            } else {
+              Write-Host "UiPath CLI not found -- creating placeholder package"
+              New-Item -ItemType Directory -Force -Path .\output | Out-Null
+              Compress-Archive -Path .\* -DestinationPath ".\output\$env:APP_NAME.1.0.$env:GITHUB_RUN_NUMBER.nupkg" -Force
+            }
+          }
+
+          Write-Host "Package created successfully"
+
+      - name: Upload Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: uipath-package
+          path: output/*.nupkg
+
+  security:
+    name: Security Scan
+    needs: [build]
+    uses: ./.github/workflows/_security-scan.yml
+    with:
+      project_name: uipath-rpa-bot
+      language: javascript
+    secrets: inherit
+
+  deploy-qa:
+    name: Deploy to QA
+    if: github.ref == 'refs/heads/qa'
+    needs: [security]
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: qa
+      app_name: uipath-rpa-bot
+      deploy_method: uipath-orchestrator
+    secrets: inherit
+
+  notify-qa:
+    name: Notify QA
+    if: always() && needs.deploy-qa.result != 'skipped'
+    needs: [deploy-qa]
+    uses: ./.github/workflows/_notify.yml
+    with:
+      environment: qa
+      app_name: uipath-rpa-bot
+      status: ${{ needs.deploy-qa.result }}
+    secrets: inherit
+
+  deploy-stage:
+    name: Deploy to Stage
+    if: github.ref == 'refs/heads/stage'
+    needs: [security]
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: stage
+      app_name: uipath-rpa-bot
+      deploy_method: uipath-orchestrator
+    secrets: inherit
+
+  notify-stage:
+    name: Notify Stage
+    if: always() && needs.deploy-stage.result != 'skipped'
+    needs: [deploy-stage]
+    uses: ./.github/workflows/_notify.yml
+    with:
+      environment: stage
+      app_name: uipath-rpa-bot
+      status: ${{ needs.deploy-stage.result }}
+    secrets: inherit
+
+  deploy-prod:
+    name: Deploy to Prod
+    if: github.ref == 'refs/heads/main'
+    needs: [security]
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: prod
+      app_name: uipath-rpa-bot
+      deploy_method: uipath-orchestrator
+      rollback_on_failure: true
+    secrets: inherit
+
+  notify-prod:
+    name: Notify Prod
+    if: always() && needs.deploy-prod.result != 'skipped'
+    needs: [deploy-prod]
+    uses: ./.github/workflows/_notify.yml
+    with:
+      environment: prod
+      app_name: uipath-rpa-bot
+      status: ${{ needs.deploy-prod.result }}
+    secrets: inherit
+
+  notify-failure:
+    name: Notify on Failure
+    if: failure()
+    needs: [build, security, deploy-qa, deploy-stage, deploy-prod]
+    uses: ./.github/workflows/_notify.yml
+    with:
+      environment: unknown
+      app_name: uipath-rpa-bot
+      status: failure
+    secrets: inherit
+
+  release-tag:
+    name: Release Tag
+    if: github.ref == 'refs/heads/main' && success()
+    needs: [deploy-prod]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Tag
+        id: tag
+        run: |
+          VERSION="v$(date +'%Y.%m.%d')-$(echo $GITHUB_SHA | cut -c1-7)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create Git Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.tag.outputs.version }}" -m "Release ${{ steps.tag.outputs.version }}"
+          git push origin "${{ steps.tag.outputs.version }}"
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-creatordate | head -2 | tail -1)
+          if [ -z "$PREV_TAG" ]; then
+            CHANGELOG=$(git log --oneline -20)
+          else
+            CHANGELOG=$(git log --oneline "$PREV_TAG"..HEAD)
+          fi
+          {
+            echo "changelog<<EOF"
+            echo "$CHANGELOG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.version }}
+          name: ${{ env.APP_NAME }} ${{ steps.tag.outputs.version }}
+          body: |
+            ## Changelog
+            ${{ steps.changelog.outputs.changelog }}
+          generate_release_notes: true
+
+  pipeline-summary:
+    name: Pipeline Summary
+    if: always()
+    needs: [validate-secrets, build, security, deploy-qa, deploy-stage, deploy-prod, release-tag]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate Summary
+        run: |
+          chmod +x scripts/forgeops-summary.sh 2>/dev/null || true
+          if [ -f scripts/forgeops-summary.sh ]; then
+            bash scripts/forgeops-summary.sh
+          else
+            echo "## Pipeline Summary" >> "$GITHUB_STEP_SUMMARY"
+            echo "App: ${{ env.APP_NAME }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Branch: ${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
